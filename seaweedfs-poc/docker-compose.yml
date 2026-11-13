@@ -1,0 +1,556 @@
+name: swfs-poc
+
+# ---------------------------------------------------------------------------
+# SeaweedFS POC - distributed cluster on a single host, three traffic planes.
+#
+#   edge    (10.77.10.0/24) - client plane.     Published on 0.0.0.0:8333.
+#   mgmt    (10.77.20.0/24) - management plane. Published on 127.0.0.1 only.
+#   cluster (10.77.30.0/24) - internal plane.   internal:true, never published.
+#
+# Only two component classes are multi-homed, and each is a deliberate gateway:
+#   s3-gw-{1,2}  edge  <-> cluster   (the S3 protocol boundary)
+#   admin, prometheus  mgmt <-> cluster   (the management boundary)
+#
+# Storage components (masters, volumes, filers, postgres) live on `cluster`
+# ONLY. There is no interface on which a client or an operator can address
+# them directly.
+# ---------------------------------------------------------------------------
+
+x-weed: &weed
+  image: ${SEAWEEDFS_IMAGE:-chrislusf/seaweedfs:4.53}
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+x-master-env: &master-env
+  # How many volumes the master pre-creates per growth request, per replication
+  # class. COPY_2 == replication "010" (2 copies, different racks).
+  WEED_MASTER_VOLUME_GROWTH_COPY_1: 1
+  WEED_MASTER_VOLUME_GROWTH_COPY_2: 2
+  WEED_MASTER_VOLUME_GROWTH_COPY_OTHER: 1
+
+x-master-healthcheck: &master-healthcheck
+  test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9333/healthz || exit 1"]
+  interval: 5s
+  timeout: 3s
+  retries: 30
+  start_period: 20s
+
+networks:
+  edge:
+    name: swfs-edge
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.name: swfs-edge
+    ipam:
+      config:
+        - subnet: 10.77.10.0/24
+
+  mgmt:
+    name: swfs-mgmt
+    driver: bridge
+    # internal:true is load-bearing, not decoration. A published port (even
+    # one bound to 127.0.0.1) installs a FORWARD-chain ACCEPT for the
+    # container IP that matches traffic arriving from ANY other Docker
+    # bridge - so publishing the admin UI would have made it reachable from
+    # the client network. Management is therefore never published; operators
+    # reach it by SSH tunnel to the fixed addresses below.
+    internal: true
+    driver_opts:
+      com.docker.network.bridge.name: swfs-mgmt
+    ipam:
+      config:
+        - subnet: 10.77.20.0/24
+
+  cluster:
+    name: swfs-cluster
+    driver: bridge
+    # No NAT to the outside world, no route in from the host network.
+    internal: true
+    driver_opts:
+      com.docker.network.bridge.name: swfs-cluster
+    ipam:
+      config:
+        - subnet: 10.77.30.0/24
+
+volumes:
+  master0-data:
+  master1-data:
+  master2-data:
+  volume1-data:
+  volume2-data:
+  volume3-data:
+  filer-meta-db:
+  admin-data:
+  prometheus-data:
+
+services:
+
+  # =========================================================================
+  # Control plane: 3 masters, Raft quorum. Tolerates the loss of 1.
+  # =========================================================================
+  master0:
+    <<: *weed
+    container_name: swfs-master0
+    hostname: master0
+    networks: [cluster]
+    volumes:
+      - master0-data:/data
+    environment: *master-env
+    command: >
+      master
+      -ip=master0
+      -ip.bind=0.0.0.0
+      -port=9333
+      -peers=master0:9333,master1:9333,master2:9333
+      -mdir=/data
+      -raftHashicorp
+      -electionTimeout=3s
+      -defaultReplication=010
+      -volumeSizeLimitMB=256
+      -metricsPort=9324
+      -telemetry=false
+    healthcheck: *master-healthcheck
+
+  master1:
+    <<: *weed
+    container_name: swfs-master1
+    hostname: master1
+    networks: [cluster]
+    volumes:
+      - master1-data:/data
+    environment: *master-env
+    command: >
+      master
+      -ip=master1
+      -ip.bind=0.0.0.0
+      -port=9333
+      -peers=master0:9333,master1:9333,master2:9333
+      -mdir=/data
+      -raftHashicorp
+      -electionTimeout=3s
+      -defaultReplication=010
+      -volumeSizeLimitMB=256
+      -metricsPort=9324
+      -telemetry=false
+    healthcheck: *master-healthcheck
+
+  master2:
+    <<: *weed
+    container_name: swfs-master2
+    hostname: master2
+    networks: [cluster]
+    volumes:
+      - master2-data:/data
+    environment: *master-env
+    command: >
+      master
+      -ip=master2
+      -ip.bind=0.0.0.0
+      -port=9333
+      -peers=master0:9333,master1:9333,master2:9333
+      -mdir=/data
+      -raftHashicorp
+      -electionTimeout=3s
+      -defaultReplication=010
+      -volumeSizeLimitMB=256
+      -metricsPort=9324
+      -telemetry=false
+    healthcheck: *master-healthcheck
+
+  # =========================================================================
+  # Storage plane: 3 volume servers, one per simulated rack.
+  # Replication 010 => 2 copies, each in a different rack.
+  # publicUrl is deliberately an internal name: nothing must ever hand a
+  # client a directly-dialable volume server URL.
+  # =========================================================================
+  volume1:
+    <<: *weed
+    container_name: swfs-volume1
+    hostname: volume1
+    networks: [cluster]
+    volumes:
+      - volume1-data:/data
+    command: >
+      volume
+      -ip=volume1
+      -ip.bind=0.0.0.0
+      -port=8080
+      -publicUrl=volume1:8080
+      -master=master0:9333,master1:9333,master2:9333
+      -dataCenter=dc1
+      -rack=rack1
+      -dir=/data
+      -max=20
+      -preStopSeconds=1
+      -metricsPort=9325
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/healthz || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 15s
+    depends_on:
+      master0: {condition: service_healthy}
+      master1: {condition: service_healthy}
+      master2: {condition: service_healthy}
+
+  volume2:
+    <<: *weed
+    container_name: swfs-volume2
+    hostname: volume2
+    networks: [cluster]
+    volumes:
+      - volume2-data:/data
+    command: >
+      volume
+      -ip=volume2
+      -ip.bind=0.0.0.0
+      -port=8080
+      -publicUrl=volume2:8080
+      -master=master0:9333,master1:9333,master2:9333
+      -dataCenter=dc1
+      -rack=rack2
+      -dir=/data
+      -max=20
+      -preStopSeconds=1
+      -metricsPort=9325
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/healthz || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 15s
+    depends_on:
+      master0: {condition: service_healthy}
+      master1: {condition: service_healthy}
+      master2: {condition: service_healthy}
+
+  volume3:
+    <<: *weed
+    container_name: swfs-volume3
+    hostname: volume3
+    networks: [cluster]
+    volumes:
+      - volume3-data:/data
+    command: >
+      volume
+      -ip=volume3
+      -ip.bind=0.0.0.0
+      -port=8080
+      -publicUrl=volume3:8080
+      -master=master0:9333,master1:9333,master2:9333
+      -dataCenter=dc1
+      -rack=rack3
+      -dir=/data
+      -max=20
+      -preStopSeconds=1
+      -metricsPort=9325
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/healthz || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 15s
+    depends_on:
+      master0: {condition: service_healthy}
+      master1: {condition: service_healthy}
+      master2: {condition: service_healthy}
+
+  # =========================================================================
+  # Metadata store for the filer tier. Shared so that both filers are
+  # interchangeable. Cluster-only: no publish, no egress, no mgmt access.
+  # NOTE: this single Postgres is the one remaining SPOF in the POC.
+  # =========================================================================
+  filer-db:
+    image: postgres:16-alpine
+    container_name: swfs-filer-db
+    hostname: filer-db
+    restart: unless-stopped
+    networks: [cluster]
+    volumes:
+      - filer-meta-db:/var/lib/postgresql/data
+    environment:
+      POSTGRES_USER: ${FILER_DB_USER:-seaweedfs}
+      POSTGRES_PASSWORD: ${FILER_DB_PASSWORD:-seaweedfs_poc_pw}
+      POSTGRES_DB: ${FILER_DB_NAME:-seaweedfs}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${FILER_DB_USER:-seaweedfs} -d ${FILER_DB_NAME:-seaweedfs}"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # =========================================================================
+  # Metadata plane: 2 stateless filers over the shared store.
+  # =========================================================================
+  filer1:
+    <<: *weed
+    container_name: swfs-filer1
+    hostname: filer1
+    networks: [cluster]
+    volumes:
+      - ./config/filer.toml:/etc/seaweedfs/filer.toml:ro
+    environment:
+      WEED_POSTGRES_USERNAME: ${FILER_DB_USER:-seaweedfs}
+      WEED_POSTGRES_PASSWORD: ${FILER_DB_PASSWORD:-seaweedfs_poc_pw}
+      WEED_POSTGRES_DATABASE: ${FILER_DB_NAME:-seaweedfs}
+    command: >
+      filer
+      -ip=filer1
+      -ip.bind=0.0.0.0
+      -port=8888
+      -master=master0:9333,master1:9333,master2:9333
+      -defaultReplicaPlacement=010
+      -dataCenter=dc1
+      -metricsPort=9326
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8888/healthz || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 20s
+    depends_on:
+      filer-db: {condition: service_healthy}
+      volume1: {condition: service_healthy}
+      volume2: {condition: service_healthy}
+      volume3: {condition: service_healthy}
+
+  filer2:
+    <<: *weed
+    container_name: swfs-filer2
+    hostname: filer2
+    networks: [cluster]
+    volumes:
+      - ./config/filer.toml:/etc/seaweedfs/filer.toml:ro
+    environment:
+      WEED_POSTGRES_USERNAME: ${FILER_DB_USER:-seaweedfs}
+      WEED_POSTGRES_PASSWORD: ${FILER_DB_PASSWORD:-seaweedfs_poc_pw}
+      WEED_POSTGRES_DATABASE: ${FILER_DB_NAME:-seaweedfs}
+    command: >
+      filer
+      -ip=filer2
+      -ip.bind=0.0.0.0
+      -port=8888
+      -master=master0:9333,master1:9333,master2:9333
+      -defaultReplicaPlacement=010
+      -dataCenter=dc1
+      -metricsPort=9326
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8888/healthz || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 20s
+    depends_on:
+      filer-db: {condition: service_healthy}
+      volume1: {condition: service_healthy}
+      volume2: {condition: service_healthy}
+      volume3: {condition: service_healthy}
+
+  # =========================================================================
+  # Protocol boundary: the ONLY components on both `edge` and `cluster`.
+  # -iam=false        : no IAM admin API on a client-facing port.
+  # -port.iceberg=0   : disable extra catalog listeners (surface reduction).
+  # -port.lance=0
+  # -autoCreateBucket=false : clients cannot implicitly create buckets.
+  # =========================================================================
+  s3-gw-1:
+    <<: *weed
+    container_name: swfs-s3-gw-1
+    hostname: s3-gw-1
+    networks:
+      cluster: {}
+      edge:
+        ipv4_address: 10.77.10.11
+    volumes:
+      - ./config/s3-identities.json:/etc/seaweedfs/s3-identities.json:ro
+    command: >
+      s3
+      -ip=s3-gw-1
+      -ip.bind=0.0.0.0
+      -port=8333
+      -filer=filer1:8888,filer2:8888
+      -config=/etc/seaweedfs/s3-identities.json
+      -dataCenter=dc1
+      -iam=false
+      -port.iceberg=0
+      -port.lance=0
+      -autoCreateBucket=false
+      -allowDeleteBucketNotEmpty=false
+      -metricsPort=9327
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8333/healthz || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 15s
+    depends_on:
+      filer1: {condition: service_healthy}
+      filer2: {condition: service_healthy}
+
+  s3-gw-2:
+    <<: *weed
+    container_name: swfs-s3-gw-2
+    hostname: s3-gw-2
+    networks:
+      cluster: {}
+      edge:
+        ipv4_address: 10.77.10.12
+    volumes:
+      - ./config/s3-identities.json:/etc/seaweedfs/s3-identities.json:ro
+    command: >
+      s3
+      -ip=s3-gw-2
+      -ip.bind=0.0.0.0
+      -port=8333
+      -filer=filer2:8888,filer1:8888
+      -config=/etc/seaweedfs/s3-identities.json
+      -dataCenter=dc1
+      -iam=false
+      -port.iceberg=0
+      -port.lance=0
+      -autoCreateBucket=false
+      -allowDeleteBucketNotEmpty=false
+      -metricsPort=9327
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8333/healthz || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 15s
+    depends_on:
+      filer1: {condition: service_healthy}
+      filer2: {condition: service_healthy}
+
+  # =========================================================================
+  # The single published client entrypoint. Edge-only: it cannot reach the
+  # cluster network itself, it can only forward to the S3 gateways.
+  # =========================================================================
+  s3-lb:
+    image: nginx:1.27-alpine
+    container_name: swfs-s3-lb
+    hostname: s3-lb
+    restart: unless-stopped
+    networks: [edge]
+    ports:
+      - "${S3_PUBLISH_ADDR:-0.0.0.0}:8333:8333"
+    volumes:
+      - ./config/nginx-s3.conf:/etc/nginx/conf.d/default.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8333/healthz || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+    depends_on:
+      s3-gw-1: {condition: service_healthy}
+      s3-gw-2: {condition: service_healthy}
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # =========================================================================
+  # Management boundary: reaches the cluster, exposes a UI on 127.0.0.1.
+  # =========================================================================
+  admin:
+    <<: *weed
+    container_name: swfs-admin
+    hostname: admin
+    networks:
+      cluster: {}
+      mgmt:
+        # Fixed so `ssh -L 12535:10.77.20.10:12535 user@vm` keeps working.
+        ipv4_address: 10.77.20.10
+    volumes:
+      - admin-data:/data
+    command: >
+      admin
+      -ip=0.0.0.0
+      -port=12535
+      -port.legacy=0
+      -master=master0:9333,master1:9333,master2:9333
+      -dataDir=/data
+      -adminUser=${ADMIN_USER:-admin}
+      -adminPassword=${ADMIN_PASSWORD:-change_me_poc}
+      -iceberg.port=0
+      -lance.port=0
+    depends_on:
+      master0: {condition: service_healthy}
+      master1: {condition: service_healthy}
+      master2: {condition: service_healthy}
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: swfs-prometheus
+    hostname: prometheus
+    restart: unless-stopped
+    networks:
+      cluster: {}
+      mgmt:
+        ipv4_address: 10.77.20.11
+    volumes:
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=24h
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # =========================================================================
+  # Probe endpoints.
+  #   client : edge only  - what a tenant application sees.
+  #   ops    : mgmt only  - what an operator workstation sees.
+  #   cluster-probe : cluster only - positive control for the probe method.
+  #                   Profile-gated, started only by scripts/validate.sh.
+  #                   Break-glass `weed shell` goes through the admin
+  #                   container instead (see README).
+  # =========================================================================
+  client:
+    build: ./client
+    image: swfs-poc-client:local
+    container_name: swfs-client
+    hostname: client
+    restart: unless-stopped
+    networks: [edge]
+    environment:
+      S3_ENDPOINT: ${S3_ENDPOINT:-http://s3-lb:8333}
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-poc-app-rw}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-poc-app-rw-secret-change-me}
+      S3_RO_ACCESS_KEY: ${S3_RO_ACCESS_KEY:-poc-app-ro}
+      S3_RO_SECRET_KEY: ${S3_RO_SECRET_KEY:-poc-app-ro-secret-change-me}
+      S3_ADMIN_ACCESS_KEY: ${S3_ADMIN_ACCESS_KEY:-poc-admin}
+      S3_ADMIN_SECRET_KEY: ${S3_ADMIN_SECRET_KEY:-poc-admin-secret-change-me}
+      S3_BUCKET: ${S3_BUCKET:-poc-bucket}
+    command: ["sleep", "infinity"]
+
+  ops:
+    build: ./client
+    image: swfs-poc-client:local
+    container_name: swfs-ops
+    hostname: ops
+    restart: unless-stopped
+    networks: [mgmt]
+    command: ["sleep", "infinity"]
+
+  cluster-probe:
+    build: ./client
+    image: swfs-poc-client:local
+    container_name: swfs-cluster-probe
+    hostname: cluster-probe
+    profiles: ["probe"]
+    networks: [cluster]
+    command: ["sleep", "infinity"]

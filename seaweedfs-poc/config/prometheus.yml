@@ -1,0 +1,30 @@
+# Prometheus reaches every component over the `cluster` network and exposes
+# its own UI on the `mgmt` network (published to 127.0.0.1 only).
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: seaweedfs-master
+    static_configs:
+      - targets: ["master0:9324", "master1:9324", "master2:9324"]
+        labels: {tier: control}
+
+  - job_name: seaweedfs-volume
+    static_configs:
+      - targets: ["volume1:9325", "volume2:9325", "volume3:9325"]
+        labels: {tier: storage}
+
+  - job_name: seaweedfs-filer
+    static_configs:
+      - targets: ["filer1:9326", "filer2:9326"]
+        labels: {tier: metadata}
+
+  - job_name: seaweedfs-s3
+    static_configs:
+      - targets: ["s3-gw-1:9327", "s3-gw-2:9327"]
+        labels: {tier: gateway}
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["127.0.0.1:9090"]

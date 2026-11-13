@@ -1,0 +1,29 @@
+# SeaweedFS filer metadata store.
+#
+# Both filers point at the same Postgres instance, which is what makes them
+# interchangeable: an S3 gateway may talk to either one and see identical
+# metadata. Credentials come from WEED_POSTGRES_* env vars set in
+# docker-compose.yml so that no secret is stored in this file.
+
+[filer.options]
+recursive_delete = false
+
+# Default local store - explicitly disabled, otherwise each filer would keep
+# its own private copy of the namespace and the two would silently diverge.
+[leveldb2]
+enabled = false
+
+[postgres]
+enabled = true
+# username / password / database are injected via WEED_POSTGRES_* env vars.
+hostname = "filer-db"
+port = 5432
+schema = ""
+sslmode = "disable"
+# Let the first filer to start create the `filemeta` table (CREATE TABLE IF
+# NOT EXISTS, so the second filer starting concurrently is harmless).
+createTable = true
+connection_max_idle = 20
+connection_max_open = 40
+connection_max_lifetime_seconds = 300
+enableUpsert = true

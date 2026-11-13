@@ -1,0 +1,51 @@
+{
+  "_comment": [
+    "POC credentials. They are intentionally checked in so the demo is",
+    "reproducible; for anything real, replace this static file with the IAM",
+    "backend and rotate these keys. The values here MUST match the ones in .env",
+    "(which is what the client container uses).",
+    "",
+    "There is deliberately NO 'anonymous' identity: unauthenticated requests",
+    "are rejected at the edge, which scripts/validate.sh probes explicitly."
+  ],
+  "identities": [
+    {
+      "name": "svc-admin",
+      "credentials": [
+        {
+          "accessKey": "poc-admin",
+          "secretKey": "poc-admin-secret-change-me"
+        }
+      ],
+      "actions": ["Admin", "Read", "List", "Tagging", "Write"]
+    },
+    {
+      "name": "app-rw",
+      "credentials": [
+        {
+          "accessKey": "poc-app-rw",
+          "secretKey": "poc-app-rw-secret-change-me"
+        }
+      ],
+      "actions": [
+        "Read:poc-bucket",
+        "List:poc-bucket",
+        "Write:poc-bucket",
+        "Tagging:poc-bucket"
+      ]
+    },
+    {
+      "name": "app-ro",
+      "credentials": [
+        {
+          "accessKey": "poc-app-ro",
+          "secretKey": "poc-app-ro-secret-change-me"
+        }
+      ],
+      "actions": [
+        "Read:poc-bucket",
+        "List:poc-bucket"
+      ]
+    }
+  ]
+}
