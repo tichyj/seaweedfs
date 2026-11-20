@@ -18,7 +18,7 @@ that client, management and internal cluster traffic cannot reach each other.
         filer-db (postgres)
 ```
 
-## Cluster layout (one host, 16 containers: 14 infrastructure + 2 probes)
+## Cluster layout
 
 | Tier | Instances | Why this size |
 |---|---|---|
