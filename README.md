@@ -1,7 +1,5 @@
 # SeaweedFS POC — architecture and topology
 
-## SeaweedFS S3 POC — distributed, three network planes, single host
-
 A multi-node SeaweedFS cluster on one machine, split across three Docker networks so
 that client, management and internal cluster traffic cannot reach each other.
 
@@ -151,9 +149,6 @@ docker compose exec admin weed shell -master=master0:9333,master1:9333,master2:9
 
 Beyond the happy path, `boundary` asserts:
 
-- **exactly one port is published** in the entire deployment — in Docker ≥ 28 a
-  published port is a hole in the inter-bridge firewall no matter which host address it
-  is bound to, so the count is itself a security property;
 - the client container **cannot resolve** `master0`, `volume1`, `filer1`, `filer-db`;
 - it **cannot reach them by raw IP** either — and a `REFUSED` (RST) is scored as a
   *failure*, because that would mean the packet crossed the boundary;
